@@ -75,8 +75,8 @@ def normalize_url(href: str | None) -> str | None:
     return href
 
 
+# ====== CHROMIUM (system) ======
 def find_system_chromium() -> str | None:
-    # Railway (nixpacks) costuma expor "chromium"
     candidates = ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]
     for c in candidates:
         p = shutil.which(c)
@@ -85,13 +85,49 @@ def find_system_chromium() -> str | None:
     return None
 
 
-# ====== CORE ======
-def get_latest_video_url_debug(username: str) -> str | None:
-    """
-    Diagnóstico: pega QUALQUER /video/ do perfil público.
-    Depois que isso funcionar, ajustamos pra mirar só reposts.
-    """
+# ====== PAGE HELPERS ======
+def page_has_error_overlay(page) -> bool:
+    # Detecta a tela "Algo deu errado"
+    try:
+        return page.locator("text=Algo deu errado").count() > 0
+    except Exception:
+        return False
+
+
+def open_reposts_tab(page) -> bool:
+    # Tenta clicar pelo texto visível "Republicações"
+    try:
+        tab = page.locator("text=Republicações").first
+        if tab.count() > 0:
+            tab.click(timeout=3000)
+            page.wait_for_timeout(4500)
+            return True
+    except Exception:
+        pass
+
+    # Fallback por role=tab
+    try:
+        tab = page.get_by_role("tab", name="Republicações")
+        tab.click(timeout=3000)
+        page.wait_for_timeout(4500)
+        return True
+    except Exception:
+        return False
+
+
+def screenshot_to_telegram(page, caption: str):
+    try:
+        png = page.screenshot(full_page=True, type="png")
+        r = tg_send_photo(png, caption=caption)
+        log("Telegram photo:", r.status_code, r.text[:200])
+    except Exception as e:
+        log("Falha ao mandar print:", str(e))
+
+
+# ====== CORE: PEGAR ÚLTIMO REPOST (LINK) ======
+def get_latest_repost_url(username: str) -> str | None:
     profile_url = f"https://www.tiktok.com/@{username}"
+
     chrome_path = find_system_chromium()
     if not chrome_path:
         raise RuntimeError("Não achei Chromium no sistema. Confirma nixpacks.toml com nixPkgs=['chromium'].")
@@ -99,7 +135,7 @@ def get_latest_video_url_debug(username: str) -> str | None:
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            executable_path=chrome_path,  # <<< chave da correção
+            executable_path=chrome_path,
             args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
         page = browser.new_page()
@@ -113,40 +149,47 @@ def get_latest_video_url_debug(username: str) -> str | None:
         })
 
         page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(8000)
+        page.wait_for_timeout(9000)
 
-        # Rola pra forçar cards
-        page.mouse.wheel(0, 1800)
-        page.wait_for_timeout(3000)
-        page.mouse.wheel(0, 1800)
-        page.wait_for_timeout(3000)
-
+        # Debug
         try:
             title = page.title()
         except Exception:
             title = "(sem title)"
-
         log("TikTok title:", title)
         log("TikTok url:", page.url)
         log("Chromium usado:", chrome_path)
 
+        # Se já veio a tela de erro do TikTok, manda print
+        if page_has_error_overlay(page):
+            screenshot_to_telegram(page, "⚠️ TikTok web mostrou 'Algo deu errado' (pode ser bloqueio/instabilidade).")
+            browser.close()
+            return None
+
+        # Clique na aba Republicações
+        clicked = open_reposts_tab(page)
+        if not clicked:
+            screenshot_to_telegram(page, "⚠️ Não consegui clicar em 'Republicações'. Veja o print.")
+            browser.close()
+            return None
+
+        # Se ao entrar em Republicações der erro, print
+        if page_has_error_overlay(page):
+            screenshot_to_telegram(page, "⚠️ Após clicar em 'Republicações', apareceu 'Algo deu errado'.")
+            browser.close()
+            return None
+
+        # Rola pra forçar carregar cards de repost
+        page.mouse.wheel(0, 2200)
+        page.wait_for_timeout(3500)
+
+        # Pega o primeiro link /video/ visível na aba
         loc = page.locator("a[href*='/video/']")
         count = loc.count()
-        log("Encontrados /video/:", count)
+        log("Links /video/ em Republicações:", count)
 
         if count == 0:
-            # manda print pro Telegram
-            png = page.screenshot(full_page=True, type="png")
-            caption = (
-                f"⚠️ Sem /video/ no perfil @{username}\n"
-                f"Title: {title}\nURL: {page.url}\nChromium: {chrome_path}"
-            )
-            try:
-                r = tg_send_photo(png, caption=caption)
-                log("Telegram photo status:", r.status_code, r.text[:200])
-            except Exception as e:
-                log("Falha ao mandar print:", str(e))
-
+            screenshot_to_telegram(page, "⚠️ Entrei em 'Republicações' mas não encontrei links /video/. Veja o print.")
             browser.close()
             return None
 
@@ -161,8 +204,7 @@ def main():
     log("CHECK_EVERY_SECONDS:", CHECK_EVERY_SECONDS)
     log("DEBUG:", DEBUG)
 
-    tg_ok = telegram_sanity_check()
-    if not tg_ok:
+    if not telegram_sanity_check():
         log("❌ Telegram não respondeu OK. Ajuste variáveis e redeploy.")
         return
 
@@ -173,27 +215,23 @@ def main():
     # Confirma chromium
     chrome_path = find_system_chromium()
     if not chrome_path:
-        tg_send("❌ Não achei Chromium no sistema. Verifique nixpacks.toml com chromium.")
+        tg_send("❌ Não achei Chromium no sistema. Confirme nixpacks.toml com chromium e faça redeploy.")
         log("Chromium não encontrado no PATH.")
         return
 
-    tg_send("✅ Bot rodando. Vou checar seu perfil e te avisar quando detectar algo novo.")
+    tg_send("✅ Bot rodando. Vou monitorar 'Republicações' e te avisar quando detectar repost novo.")
 
     state = load_state()
-    last = state.get("last_url")
+    last = state.get("last_repost_url")
 
     while True:
         try:
-            latest = get_latest_video_url_debug(TIKTOK_USER)
+            latest = get_latest_repost_url(TIKTOK_USER)
 
             if latest and latest != last:
-                tg_send(
-                    "🔎 Detectei um link /video/ no seu perfil:\n"
-                    f"{latest}\n\n"
-                    "(Isso ainda é modo diagnóstico. Depois ajustamos pra pegar só reposts.)"
-                )
+                tg_send(f"↻ Repost novo detectado:\n{latest}")
                 last = latest
-                state["last_url"] = latest
+                state["last_repost_url"] = latest
                 save_state(state)
             else:
                 log("Nada novo (ou TikTok não carregou).")
