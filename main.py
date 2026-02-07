@@ -2,11 +2,12 @@ import os
 import time
 import json
 import traceback
-import shutil
 import requests
 from playwright.sync_api import sync_playwright
 
-# ====== ENV ======
+# ======================
+# ENV
+# ======================
 TIKTOK_USER = os.getenv("TIKTOK_USER", "").lstrip("@")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -19,7 +20,9 @@ def log(*args):
     print(*args, flush=True)
 
 
-# ====== TELEGRAM ======
+# ======================
+# TELEGRAM
+# ======================
 def tg_send(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     return requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=30)
@@ -52,7 +55,9 @@ def telegram_sanity_check() -> bool:
         return False
 
 
-# ====== STATE ======
+# ======================
+# STATE
+# ======================
 def load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -75,17 +80,9 @@ def normalize_url(href: str | None) -> str | None:
     return href
 
 
-# ====== CHROMIUM (system) ======
-def find_system_chromium() -> str | None:
-    candidates = ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]
-    for c in candidates:
-        p = shutil.which(c)
-        if p:
-            return p
-    return None
-
-
-# ====== PAGE HELPERS ======
+# ======================
+# PAGE HELPERS
+# ======================
 def page_has_error_overlay(page) -> bool:
     # Detecta a tela "Algo deu errado"
     try:
@@ -95,7 +92,7 @@ def page_has_error_overlay(page) -> bool:
 
 
 def open_reposts_tab(page) -> bool:
-    # Tenta clicar pelo texto visível "Republicações"
+    # Clica pelo texto visível "Republicações"
     try:
         tab = page.locator("text=Republicações").first
         if tab.count() > 0:
@@ -124,21 +121,22 @@ def screenshot_to_telegram(page, caption: str):
         log("Falha ao mandar print:", str(e))
 
 
-# ====== CORE: PEGAR ÚLTIMO REPOST (LINK) ======
+# ======================
+# CORE: PEGAR ÚLTIMO REPOST (LINK)
+# ======================
 def get_latest_repost_url(username: str) -> str | None:
     profile_url = f"https://www.tiktok.com/@{username}"
 
-    chrome_path = find_system_chromium()
-    if not chrome_path:
-        raise RuntimeError("Não achei Chromium no sistema. Confirma nixpacks.toml com nixPkgs=['chromium'].")
-
     with sync_playwright() as p:
+        # IMPORTANTE: com Dockerfile baseado em mcr.microsoft.com/playwright/...
+        # o chromium já existe e o playwright já sabe onde está.
         browser = p.chromium.launch(
             headless=True,
-            executable_path=chrome_path,
             args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
+
         page = browser.new_page()
+
         page.set_extra_http_headers({
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -156,13 +154,13 @@ def get_latest_repost_url(username: str) -> str | None:
             title = page.title()
         except Exception:
             title = "(sem title)"
-        log("TikTok title:", title)
-        log("TikTok url:", page.url)
-        log("Chromium usado:", chrome_path)
+        if DEBUG:
+            log("TikTok title:", title)
+            log("TikTok url:", page.url)
 
         # Se já veio a tela de erro do TikTok, manda print
         if page_has_error_overlay(page):
-            screenshot_to_telegram(page, "⚠️ TikTok web mostrou 'Algo deu errado' (pode ser bloqueio/instabilidade).")
+            screenshot_to_telegram(page, "⚠️ TikTok web mostrou 'Algo deu errado' (possível bloqueio/instabilidade no Railway).")
             browser.close()
             return None
 
@@ -186,7 +184,8 @@ def get_latest_repost_url(username: str) -> str | None:
         # Pega o primeiro link /video/ visível na aba
         loc = page.locator("a[href*='/video/']")
         count = loc.count()
-        log("Links /video/ em Republicações:", count)
+        if DEBUG:
+            log("Links /video/ em Republicações:", count)
 
         if count == 0:
             screenshot_to_telegram(page, "⚠️ Entrei em 'Republicações' mas não encontrei links /video/. Veja o print.")
@@ -198,6 +197,9 @@ def get_latest_repost_url(username: str) -> str | None:
         return href
 
 
+# ======================
+# MAIN LOOP
+# ======================
 def main():
     log("=== START ===")
     log("TIKTOK_USER:", TIKTOK_USER or "(vazio)")
@@ -210,13 +212,6 @@ def main():
 
     if not TIKTOK_USER:
         tg_send("⚠️ TIKTOK_USER está vazio. Coloque seu usuário nas variáveis.")
-        return
-
-    # Confirma chromium
-    chrome_path = find_system_chromium()
-    if not chrome_path:
-        tg_send("❌ Não achei Chromium no sistema. Confirme nixpacks.toml com chromium e faça redeploy.")
-        log("Chromium não encontrado no PATH.")
         return
 
     tg_send("✅ Bot rodando. Vou monitorar 'Republicações' e te avisar quando detectar repost novo.")
