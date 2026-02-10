@@ -1,245 +1,163 @@
 import os
 import time
+import base64
+import random
 import json
-import traceback
+from typing import Optional
+
 import requests
-from playwright.sync_api import sync_playwright
-
-# ======================
-# ENV
-# ======================
-TIKTOK_USER = os.getenv("TIKTOK_USER", "").lstrip("@")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-CHECK_EVERY_SECONDS = int(os.getenv("CHECK_EVERY_SECONDS", "60"))
-STATE_FILE = "state.json"
-DEBUG = os.getenv("DEBUG", "1") == "1"
+from playwright.sync_api import sync_playwright, TimeoutError
 
 
-def log(*args):
-    print(*args, flush=True)
+PROFILE_URL = os.getenv("PROFILE_URL", "https://www.tiktok.com/@cb_oliveira_santos")
+
+# Intervalo de checagem (segundos). Recomendo 12-25s pra ficar mais "humano".
+CHECK_EVERY_SECONDS = int(os.getenv("CHECK_EVERY_SECONDS", "15"))
+
+# Headless True/False
+HEADLESS = os.getenv("HEADLESS", "true").lower() in ("1", "true", "yes", "y")
+
+# Se você setar isso no Railway como secret (base64 do tiktok_state.json),
+# o app recria o arquivo em runtime sem precisar comitar.
+STORAGE_STATE_B64 = os.getenv("STORAGE_STATE_B64", "")
+
+# Opcional: enviar POST quando detectar mudança
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # ex: https://seu-endpoint.com/hook
+
+# Onde salvar o state no container
+STATE_PATH = "tiktok_state.json"
 
 
-# ======================
-# TELEGRAM
-# ======================
-def tg_send(text: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    return requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=30)
-
-
-def tg_send_photo(png_bytes: bytes, caption: str = ""):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-    files = {"photo": ("debug.png", png_bytes)}
-    data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]}
-    return requests.post(url, files=files, data=data, timeout=60)
-
-
-def telegram_sanity_check() -> bool:
-    log("== TELEGRAM SANITY CHECK ==")
-    if not TELEGRAM_TOKEN:
-        log("ERRO: TELEGRAM_TOKEN vazio")
+def write_storage_state_from_env() -> bool:
+    if not STORAGE_STATE_B64.strip():
         return False
-    if not TELEGRAM_CHAT_ID:
-        log("ERRO: TELEGRAM_CHAT_ID vazio")
-        return False
+    raw = base64.b64decode(STORAGE_STATE_B64.encode("utf-8"))
+    with open(STATE_PATH, "wb") as f:
+        f.write(raw)
+    return True
 
+
+def safe_post_webhook(payload: dict) -> None:
+    if not WEBHOOK_URL.strip():
+        return
     try:
-        r = tg_send("🧪 PING: bot iniciou e está testando Telegram.")
-        log("Telegram status:", r.status_code)
-        log("Telegram resp:", r.text[:300])
-        return r.ok
+        requests.post(
+            WEBHOOK_URL,
+            json=payload,
+            timeout=15,
+            headers={"Content-Type": "application/json"},
+        )
     except Exception as e:
-        log("ERRO Telegram:", str(e))
-        log(traceback.format_exc())
-        return False
+        print(f"[webhook] erro: {e}")
 
 
-# ======================
-# STATE
-# ======================
-def load_state():
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+def click_reposts_tab(page) -> None:
+    # "Republicações" como tab costuma ser estável
+    page.get_by_role("tab", name="Republicações").click()
+    page.wait_for_timeout(1200)
 
 
-def save_state(state: dict):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f)
+def find_first_video_href(page) -> Optional[str]:
+    # Depois de clicar em Republicações, o primeiro card geralmente tem link /video/
+    # Tentamos alguns seletores comuns e pegamos o primeiro href válido.
+    selectors = [
+        '[data-e2e="user-repost-item"] a[href*="/video/"]',
+        '[data-e2e="user-post-item"] a[href*="/video/"]',
+        'a[href*="/video/"]',
+    ]
+
+    for sel in selectors:
+        loc = page.locator(sel)
+        try:
+            loc.first.wait_for(state="visible", timeout=6000)
+            href = loc.first.get_attribute("href")
+            if href and "/video/" in href:
+                return href
+        except TimeoutError:
+            continue
+
+    return None
 
 
-def normalize_url(href: str | None) -> str | None:
-    if not href:
-        return None
-    href = href.strip()
-    if href.startswith("/"):
-        return "https://www.tiktok.com" + href
-    return href
+def open_first_repost(page) -> None:
+    # Abrir o primeiro card (mais à esquerda da primeira linha)
+    loc = page.locator('a[href*="/video/"]').first
+    loc.wait_for(state="visible", timeout=8000)
+    loc.click()
 
 
-# ======================
-# PAGE HELPERS
-# ======================
-def page_has_error_overlay(page) -> bool:
-    # Detecta a tela "Algo deu errado"
-    try:
-        return page.locator("text=Algo deu errado").count() > 0
-    except Exception:
-        return False
+def jitter_sleep(base_seconds: int) -> None:
+    # adiciona variação pra parecer menos robótico
+    jitter = random.randint(0, 6)
+    time.sleep(base_seconds + jitter)
 
 
-def open_reposts_tab(page) -> bool:
-    # Clica pelo texto visível "Republicações"
-    try:
-        tab = page.locator("text=Republicações").first
-        if tab.count() > 0:
-            tab.click(timeout=3000)
-            page.wait_for_timeout(4500)
-            return True
-    except Exception:
-        pass
-
-    # Fallback por role=tab
-    try:
-        tab = page.get_by_role("tab", name="Republicações")
-        tab.click(timeout=3000)
-        page.wait_for_timeout(4500)
-        return True
-    except Exception:
-        return False
-
-
-def screenshot_to_telegram(page, caption: str):
-    try:
-        png = page.screenshot(full_page=True, type="png")
-        r = tg_send_photo(png, caption=caption)
-        log("Telegram photo:", r.status_code, r.text[:200])
-    except Exception as e:
-        log("Falha ao mandar print:", str(e))
-
-
-# ======================
-# CORE: PEGAR ÚLTIMO REPOST (LINK)
-# ======================
-def get_latest_repost_url(username: str) -> str | None:
-    profile_url = f"https://www.tiktok.com/@{username}"
+def main():
+    wrote = write_storage_state_from_env()
+    if wrote:
+        print("[init] storage_state carregado do env.")
+    else:
+        print("[init] STORAGE_STATE_B64 vazio. Você precisa setar isso no Railway (recomendado).")
 
     with sync_playwright() as p:
-        # IMPORTANTE: com Dockerfile baseado em mcr.microsoft.com/playwright/...
-        # o chromium já existe e o playwright já sabe onde está.
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
-        )
+        browser = p.chromium.launch(headless=HEADLESS)
 
-        page = browser.new_page()
+        # Se tiver state, usa. Se não tiver, abre sem e provavelmente vai bater em login/limitações.
+        if os.path.exists(STATE_PATH):
+            context = browser.new_context(storage_state=STATE_PATH)
+        else:
+            context = browser.new_context()
 
-        page.set_extra_http_headers({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "pt-BR,pt;q=0.9",
-        })
+        page = context.new_page()
 
-        page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(9000)
+        print(f"[start] Abrindo perfil: {PROFILE_URL}")
+        page.goto(PROFILE_URL, wait_until="domcontentloaded")
+        page.wait_for_timeout(1500)
 
-        # Debug
-        try:
-            title = page.title()
-        except Exception:
-            title = "(sem title)"
-        if DEBUG:
-            log("TikTok title:", title)
-            log("TikTok url:", page.url)
+        click_reposts_tab(page)
 
-        # Se já veio a tela de erro do TikTok, manda print
-        if page_has_error_overlay(page):
-            screenshot_to_telegram(page, "⚠️ TikTok web mostrou 'Algo deu errado' (possível bloqueio/instabilidade no Railway).")
-            browser.close()
-            return None
+        last_first_href = find_first_video_href(page)
+        print(f"[baseline] primeiro vídeo: {last_first_href}")
 
-        # Clique na aba Republicações
-        clicked = open_reposts_tab(page)
-        if not clicked:
-            screenshot_to_telegram(page, "⚠️ Não consegui clicar em 'Republicações'. Veja o print.")
-            browser.close()
-            return None
+        while True:
+            jitter_sleep(CHECK_EVERY_SECONDS)
 
-        # Se ao entrar em Republicações der erro, print
-        if page_has_error_overlay(page):
-            screenshot_to_telegram(page, "⚠️ Após clicar em 'Republicações', apareceu 'Algo deu errado'.")
-            browser.close()
-            return None
-
-        # Rola pra forçar carregar cards de repost
-        page.mouse.wheel(0, 2200)
-        page.wait_for_timeout(3500)
-
-        # Pega o primeiro link /video/ visível na aba
-        loc = page.locator("a[href*='/video/']")
-        count = loc.count()
-        if DEBUG:
-            log("Links /video/ em Republicações:", count)
-
-        if count == 0:
-            screenshot_to_telegram(page, "⚠️ Entrei em 'Republicações' mas não encontrei links /video/. Veja o print.")
-            browser.close()
-            return None
-
-        href = normalize_url(loc.first.get_attribute("href"))
-        browser.close()
-        return href
-
-
-# ======================
-# MAIN LOOP
-# ======================
-def main():
-    log("=== START ===")
-    log("TIKTOK_USER:", TIKTOK_USER or "(vazio)")
-    log("CHECK_EVERY_SECONDS:", CHECK_EVERY_SECONDS)
-    log("DEBUG:", DEBUG)
-
-    if not telegram_sanity_check():
-        log("❌ Telegram não respondeu OK. Ajuste variáveis e redeploy.")
-        return
-
-    if not TIKTOK_USER:
-        tg_send("⚠️ TIKTOK_USER está vazio. Coloque seu usuário nas variáveis.")
-        return
-
-    tg_send("✅ Bot rodando. Vou monitorar 'Republicações' e te avisar quando detectar repost novo.")
-
-    state = load_state()
-    last = state.get("last_repost_url")
-
-    while True:
-        try:
-            latest = get_latest_repost_url(TIKTOK_USER)
-
-            if latest and latest != last:
-                tg_send(f"↻ Repost novo detectado:\n{latest}")
-                last = latest
-                state["last_repost_url"] = latest
-                save_state(state)
-            else:
-                log("Nada novo (ou TikTok não carregou).")
-
-        except Exception as e:
-            log("ERRO no loop:", str(e))
-            log(traceback.format_exc())
             try:
-                tg_send(f"❌ Erro no bot:\n{str(e)[:250]}")
-            except Exception:
-                pass
+                page.reload(wait_until="domcontentloaded")
+                page.wait_for_timeout(1200)
+                click_reposts_tab(page)
 
-        time.sleep(CHECK_EVERY_SECONDS)
+                first_href = find_first_video_href(page)
+                print(f"[check] primeiro vídeo: {first_href}")
+
+                if first_href and first_href != last_first_href:
+                    print("[DETECT] Novo repost detectado! Abrindo primeiro card...")
+                    open_first_repost(page)
+                    page.wait_for_timeout(1500)
+
+                    payload = {
+                        "event": "new_repost_detected",
+                        "profile_url": PROFILE_URL,
+                        "first_video_href": first_href,
+                        "ts": int(time.time()),
+                    }
+                    safe_post_webhook(payload)
+
+                    last_first_href = first_href
+                else:
+                    print("[ok] Sem novidade.")
+
+            except Exception as e:
+                print(f"[err] {e}")
+                # tenta recuperar
+                try:
+                    page.goto(PROFILE_URL, wait_until="domcontentloaded")
+                    page.wait_for_timeout(1500)
+                    click_reposts_tab(page)
+                except Exception as e2:
+                    print(f"[recover_err] {e2}")
+
+        # browser.close()
 
 
 if __name__ == "__main__":
