@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.env
+tiktok_state.json
